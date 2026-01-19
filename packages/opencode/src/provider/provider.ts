@@ -7,6 +7,7 @@ import { Log } from "../util/log"
 import { BunProc } from "../bun"
 import { Plugin } from "../plugin"
 import { ModelsDev } from "./models"
+import { fetchToken, prepareProvider, buildUserString, handleReactiveAuthError } from "./circuit"
 import { NamedError } from "@opencode-ai/util/error"
 import { Auth } from "../auth"
 import { Env } from "../env"
@@ -498,6 +499,19 @@ export namespace Provider {
         },
       }
     },
+    circuit: async () => {
+      const result = await fetchToken()
+      if (!result) return { autoload: false }
+      const user = buildUserString()
+      return {
+        autoload: true,
+        options: {
+          headers: { "api-key": result.apiKey },
+          expiry: result.expiry,
+          user,
+        },
+      }
+    },
   }
 
   export const Model = z
@@ -970,8 +984,20 @@ export namespace Provider {
         options["includeUsage"] = true
       }
 
-      if (!options["baseURL"]) options["baseURL"] = model.api.url
+      // For Circuit, centralize option preparation (user stringify, baseURL, apiVersion, expiry refresh)
+      // NOTE: prepareProvider mutates `options` and persists refreshed auth to provider state.
+      if (provider.id === "circuit") {
+        await prepareProvider(provider, model, async () => s, options)
+      } else {
+        if (!options["baseURL"]) options["baseURL"] = model.api.url
+      }
       if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
+
+      log.info("SDK options for " + provider.id, {
+        apiKey: options["apiKey"] ? "present" : "absent",
+        baseURL: options["baseURL"],
+        user: options["user"],
+      })
       if (model.headers)
         options["headers"] = {
           ...options["headers"],
@@ -1074,23 +1100,55 @@ export namespace Provider {
     const provider = s.providers[model.providerID]
     const sdk = await getSDK(model)
 
-    try {
-      const language = s.modelLoaders[model.providerID]
-        ? await s.modelLoaders[model.providerID](sdk, model.api.id, provider.options)
-        : sdk.languageModel(model.api.id)
+    let language: any
+
+    const finish = (language: any) => {
       s.models.set(key, language)
       return language
+    }
+
+    try {
+      language = s.modelLoaders[model.providerID]
+        ? await s.modelLoaders[model.providerID](sdk, model.api.id, provider.options)
+        : sdk.languageModel(model.api.id)
+      return finish(language)
     } catch (e) {
-      if (e instanceof NoSuchModelError)
+      const error = e as Error
+      if (
+        model.providerID === "circuit" &&
+        /401|403|unauthoriz|authorization failed|token expired|invalid token/i.test(error.message || "")
+      ) {
+        log.info("Reactive auth error detected", {
+          providerID: model.providerID,
+          modelID: model.id,
+          errorMessage: error.message,
+          currentTime: new Date().toISOString(),
+        })
+        log.warn("Auth error detected, attempting token refresh", {
+          providerID: model.providerID,
+          modelID: model.id,
+          error: error.message,
+        })
+        // Use the Circuit helper to handle reactive refresh, which will update state
+        await handleReactiveAuthError(model.providerID, async () => state())
+        // Retry with new SDK
+        const sdk2 = await getSDK(model)
+        language = s.modelLoaders[model.providerID]
+          ? await s.modelLoaders[model.providerID](sdk2, model.api.id, provider.options)
+          : sdk2.languageModel(model.api.id)
+      } else if (error instanceof NoSuchModelError) {
         throw new ModelNotFoundError(
           {
             modelID: model.id,
             providerID: model.providerID,
           },
-          { cause: e },
+          { cause: error },
         )
-      throw e
+      } else {
+        throw error
+      }
     }
+    return finish(language)
   }
 
   export async function closest(providerID: string, query: string[]) {

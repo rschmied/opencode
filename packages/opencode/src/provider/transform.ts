@@ -4,6 +4,7 @@ import type { JSONSchema } from "zod/v4/core"
 import type { Provider } from "./provider"
 import type { ModelsDev } from "./models"
 import { iife } from "@/util/iife"
+import { buildUserString } from "./circuit"
 
 type Modality = NonNullable<ModelsDev.Model["modalities"]>["input"][number]
 
@@ -551,6 +552,13 @@ export namespace ProviderTransform {
         result["reasoningSummary"] = "auto"
       }
     }
+
+    if (input.model.providerID === "circuit") {
+      // Keep `user` as a JSON string; the SDK expects string form and Circuit
+      // deployments expect a string in the request body
+      result["user"] = buildUserString()
+    }
+
     return result
   }
 
